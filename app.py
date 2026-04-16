@@ -26,7 +26,7 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # 경로 상수
 # ---------------------------------------------------------------------------
-DATA_PATH   = Path("data/enriched_products_final.csv")
+DATA_PATH   = Path("enriched_products_final.csv")
 CHROMA_DIR  = Path("chroma_db")
 COLLECTION  = "olist_products"
 MODEL_NAME  = "all-MiniLM-L6-v2"
