@@ -1,7 +1,7 @@
 """
 app.py
 RAG 기반 Olist 상품 추천 Streamlit 앱
-- chroma_db/ 없으면 자동 빌드
+- faiss_index.bin / faiss_metadata.pkl 없으면 자동 빌드
 - 사이드바 필터 (카테고리 / 가격 / 평점 / 결과 수)
 - 의미 검색 + 결과 카드 UI
 """
@@ -26,15 +26,14 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # 경로 상수
 # ---------------------------------------------------------------------------
-DATA_PATH   = Path("data/enriched_products_final.csv")
-CHROMA_DIR  = Path("chroma_db")
-COLLECTION  = "olist_products"
-MODEL_NAME  = "all-MiniLM-L6-v2"
-BATCH_SIZE  = 500
+DATA_PATH        = Path("data/enriched_products_final.csv")
+FAISS_INDEX_PATH = Path("faiss_index.bin")
+FAISS_META_PATH  = Path("faiss_metadata.pkl")
+MODEL_NAME       = "all-MiniLM-L6-v2"
+BATCH_SIZE       = 500
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
-logging.getLogger("chromadb").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # 캐시: CSV 로드
@@ -54,10 +53,12 @@ def load_model():
 
 
 # ---------------------------------------------------------------------------
-# 벡터 DB 빌드 (chroma_db/ 없을 때만)
+# 벡터 DB 빌드 (faiss_index.bin 없을 때만)
 # ---------------------------------------------------------------------------
 def build_vectorstore(df: pd.DataFrame, model) -> None:
-    import chromadb
+    import faiss
+    import pickle
+    import numpy as np
 
     st.info("벡터 DB를 처음 구축합니다. 약 20~30분 소요됩니다.")
     progress = st.progress(0, text="임베딩 생성 중...")
@@ -79,7 +80,6 @@ def build_vectorstore(df: pd.DataFrame, model) -> None:
         )
 
     documents = df.apply(make_text, axis=1).tolist()
-    ids       = df["product_id"].astype(str).tolist()
     metadatas = [
         {
             "product_id":   str(r["product_id"]),
@@ -94,57 +94,56 @@ def build_vectorstore(df: pd.DataFrame, model) -> None:
     # 배치 임베딩
     n = len(documents)
     n_batches = math.ceil(n / BATCH_SIZE)
-    all_embeddings = []
+    all_vecs = []
     for i in range(n_batches):
         batch = documents[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
-        vecs  = model.encode(batch, show_progress_bar=False)
-        all_embeddings.extend(vecs.tolist())
+        vecs  = model.encode(batch, show_progress_bar=False, normalize_embeddings=True)
+        all_vecs.append(vecs)
         progress.progress((i + 1) / n_batches, text=f"임베딩 생성 중... {min((i+1)*BATCH_SIZE, n):,}/{n:,}")
 
-    # ChromaDB 저장
-    progress.progress(1.0, text="ChromaDB에 저장 중...")
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    client     = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    collection = client.create_collection(COLLECTION, metadata={"hnsw:space": "cosine"})
+    # FAISS 인덱스 구축 (코사인 유사도 = 정규화 벡터의 내적)
+    progress.progress(1.0, text="FAISS 인덱스 저장 중...")
+    matrix = np.vstack(all_vecs).astype("float32")
+    dim    = matrix.shape[1]
+    index  = faiss.IndexFlatIP(dim)   # Inner Product on normalized vectors = cosine
+    index.add(matrix)
 
-    for i in range(n_batches):
-        s = i * BATCH_SIZE
-        e = (i + 1) * BATCH_SIZE
-        collection.add(
-            ids=ids[s:e],
-            embeddings=all_embeddings[s:e],
-            documents=documents[s:e],
-            metadatas=metadatas[s:e],
-        )
+    faiss.write_index(index, str(FAISS_INDEX_PATH))
+    with open(FAISS_META_PATH, "wb") as f:
+        pickle.dump(metadatas, f)
 
     progress.empty()
     st.success(f"벡터 DB 구축 완료! {n:,}개 상품이 저장되었습니다.")
 
 
 # ---------------------------------------------------------------------------
-# 캐시: ChromaDB 클라이언트 + 컬렉션
+# 캐시: FAISS 인덱스 + 메타데이터 로드
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
-def get_collection():
-    import chromadb
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    return client.get_collection(COLLECTION)
+def load_faiss_store():
+    import faiss
+    import pickle
+    index = faiss.read_index(str(FAISS_INDEX_PATH))
+    with open(FAISS_META_PATH, "rb") as f:
+        metadatas = pickle.load(f)
+    return index, metadatas
 
 
 # ---------------------------------------------------------------------------
 # 검색 함수
 # ---------------------------------------------------------------------------
-def search(query: str, model, collection, top_k: int = 20):
-    vec     = model.encode([query]).tolist()
-    results = collection.query(
-        query_embeddings=vec,
-        n_results=top_k,
-        include=["metadatas", "distances"],
-    )
+def search(query: str, model, faiss_store, top_k: int = 20):
+    import numpy as np
+    index, metadatas = faiss_store
+    vec = model.encode([query], normalize_embeddings=True).astype("float32")
+    scores, indices = index.search(vec, top_k)
     items = []
-    for meta, dist in zip(results["metadatas"][0], results["distances"][0]):
-        meta["similarity"] = round(1 - dist, 4)
-        items.append(meta)
+    for score, idx in zip(scores[0], indices[0]):
+        if idx == -1:
+            continue
+        item = dict(metadatas[idx])
+        item["similarity"] = round(float(score), 4)
+        items.append(item)
     return items
 
 
@@ -245,21 +244,21 @@ def main():
         )
 
         st.markdown("---")
-        st.caption("powered by ChromaDB + sentence-transformers")
+        st.caption("powered by FAISS + sentence-transformers")
 
     # ── 벡터 DB 초기화 ────────────────────────────────────────────────────
     with st.spinner("모델 로드 중..."):
         model = load_model()
 
-    if not CHROMA_DIR.exists() or not any(CHROMA_DIR.iterdir()):
+    if not FAISS_INDEX_PATH.exists() or not FAISS_META_PATH.exists():
         build_vectorstore(df, model)
-        st.cache_resource.clear()   # 새로 만든 컬렉션 캐시 반영
+        st.cache_resource.clear()   # 새로 만든 인덱스 캐시 반영
         st.rerun()
 
     try:
-        collection = get_collection()
+        faiss_store = load_faiss_store()
     except Exception as e:
-        st.error(f"ChromaDB 로드 실패: {e}\n\nchroma_db/ 폴더를 삭제하고 앱을 재시작해 주세요.")
+        st.error(f"FAISS 인덱스 로드 실패: {e}\n\nfaiss_index.bin / faiss_metadata.pkl 을 삭제하고 앱을 재시작해 주세요.")
         st.stop()
 
     # ── 메인 헤더 ─────────────────────────────────────────────────────────
@@ -311,7 +310,7 @@ def main():
             st.session_state["history"] = hist[:10]
 
         with st.spinner("검색 중..."):
-            raw_results = search(query_input, model, collection, top_k=50)
+            raw_results = search(query_input, model, faiss_store, top_k=50)
 
         # 필터 적용
         filtered = []

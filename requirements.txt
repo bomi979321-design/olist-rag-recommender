@@ -1,7 +1,7 @@
 # Python >= 3.14 required for local dev (pickle compatibility with pandas 3.x StringDtype)
 # Streamlit Cloud uses Python 3.11+ which is compatible
 streamlit>=1.35.0
-chromadb>=1.5.0
+faiss-cpu>=1.7.4
 sentence-transformers>=5.0.0
 pandas>=2.0.0
 numpy>=1.26.0
